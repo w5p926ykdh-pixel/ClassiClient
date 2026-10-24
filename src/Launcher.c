@@ -348,6 +348,32 @@ const struct LauncherTheme Launcher_NordicTheme = {
 	BitmapColor_RGB( 76,  86, 106), /* button highlight */
 };
 
+#define THEME_PRESET(bg, border, active, fore, hl) { false, bg, border, active, fore, hl }
+struct ThemePreset { const char* name; struct LauncherTheme theme; };
+static const struct ThemePreset themePresets[] = {
+	{ "midnight", THEME_PRESET(BitmapColor_RGB( 20,  18,  31), BitmapColor_RGB( 10,   8,  18), BitmapColor_RGB( 88,  72, 160), BitmapColor_RGB( 58,  50,  98), BitmapColor_RGB(110,  96, 190)) },
+	{ "forest",   THEME_PRESET(BitmapColor_RGB( 16,  35,  26), BitmapColor_RGB(  8,  18,  13), BitmapColor_RGB( 52, 118,  80), BitmapColor_RGB( 36,  84,  58), BitmapColor_RGB( 84, 160, 116)) },
+	{ "ember",    THEME_PRESET(BitmapColor_RGB( 36,  18,  12), BitmapColor_RGB( 18,   8,   5), BitmapColor_RGB(160,  76,  40), BitmapColor_RGB(110,  52,  28), BitmapColor_RGB(214, 120,  70)) },
+	{ "ocean",    THEME_PRESET(BitmapColor_RGB( 12,  30,  46), BitmapColor_RGB(  6,  14,  22), BitmapColor_RGB( 40, 120, 170), BitmapColor_RGB( 28,  86, 128), BitmapColor_RGB( 90, 170, 215)) },
+	{ "rose",     THEME_PRESET(BitmapColor_RGB( 42,  18,  32), BitmapColor_RGB( 20,   8,  16), BitmapColor_RGB(170,  60, 120), BitmapColor_RGB(120,  44,  86), BitmapColor_RGB(225, 120, 170)) },
+	{ "nordic",   THEME_PRESET(BitmapColor_RGB( 46,  52,  64), BitmapColor_RGB( 59,  66,  82), BitmapColor_RGB( 66,  74,  90), BitmapColor_RGB( 59,  66,  82), BitmapColor_RGB( 76,  86, 106)) }
+};
+
+/* Applies the preset named by "launcher-theme" in options.txt (if any) */
+static void ApplyThemePreset(struct LauncherTheme* theme) {
+	cc_string name; char nameBuffer[STRING_SIZE];
+	int i;
+	String_InitArray(name, nameBuffer);
+	Options_Get("launcher-theme", &name, "");
+	if (!name.length) return;
+
+	for (i = 0; i < Array_Elems(themePresets); i++) {
+		if (!String_CaselessEqualsConst(&name, themePresets[i].name)) continue;
+		*theme = themePresets[i].theme;
+		return;
+	}
+}
+
 CC_NOINLINE static void ParseColor(const char* key, BitmapCol* color) {
 	cc_uint8 rgb[3];
 	if (!Options_GetColor(key, rgb)) return;
@@ -362,6 +388,7 @@ void LauncherTheme_Load(struct LauncherTheme* theme) {
 	}
 	*theme = Launcher_ModernTheme;
 	theme->ClassicBackground = Options_GetBool("nostalgia-classicbg", false);
+	ApplyThemePreset(theme);
 
 	ParseColor("launcher-back-col",                   &theme->BackgroundColor);
 	ParseColor("launcher-btn-border-col",             &theme->ButtonBorderColor);
@@ -531,7 +558,86 @@ CC_NOINLINE static void ClearTile(int x, int y, int width, int height,
 	}
 }
 
+/* Custom background image: options.txt "launcher-bg-image" (default launcher-bg.png), */
+/*  darkened by "launcher-bg-dim" percent (0-90, default 35) so buttons stay readable   */
+static struct Bitmap customBg, customFit;
+static cc_bool customTried;
+static int customDim;
+
+static void CustomBg_Load(void) {
+	cc_string path; char pathBuffer[STRING_SIZE];
+	struct Stream stream, buffered;
+	cc_uint8 buffer[8192];
+	cc_result res;
+
+	customTried = true;
+	customDim   = Options_GetInt("launcher-bg-dim", 0, 90, 35);
+	String_InitArray(path, pathBuffer);
+	Options_Get("launcher-bg-image", &path, "launcher-bg.png");
+
+	res = Stream_OpenFile(&stream, &path);
+	if (res) return; /* no custom image, which is fine */
+
+	Stream_ReadonlyBuffered(&buffered, &stream, buffer, sizeof(buffer));
+	res = Png_Decode(&customBg, &buffered);
+	stream.Close(&stream);
+
+	if (res) {
+		customBg.scan0 = NULL;
+		Logger_SysWarn2(res, "decoding", &path);
+	}
+}
+
+/* Scales the image to cover the whole window (cropping the edges), then darkens it */
+static void CustomBg_Fit(int width, int height) {
+	int srcW = customBg.width, srcH = customBg.height;
+	int cropW, cropH, i, count;
+	BitmapCol* px;
+	float scale = (100 - customDim) / 100.0f;
+
+	if (customFit.scan0) Mem_Free(customFit.scan0);
+	customFit.scan0 = NULL;
+	customFit.width = 0; customFit.height = 0;
+	if (width <= 0 || height <= 0) return;
+
+	Bitmap_TryAllocate(&customFit, width, height);
+	if (!customFit.scan0) return;
+
+	if (srcW * height > srcH * width) {
+		cropH = srcH; cropW = srcH * width / height;
+	} else {
+		cropW = srcW; cropH = srcW * height / width;
+	}
+	if (cropW < 1) cropW = 1;
+	if (cropH < 1) cropH = 1;
+	Bitmap_Scale(&customFit, &customBg, (srcW - cropW) / 2, (srcH - cropH) / 2, cropW, cropH);
+
+	px = customFit.scan0; count = width * height;
+	for (i = 0; i < count; i++) {
+		px[i] = BitmapColor_Scale(px[i], scale);
+	}
+}
+
+static cc_bool CustomBg_Draw(struct Context2D* ctx, int x, int y, int width, int height) {
+	struct Bitmap* dst = (struct Bitmap*)ctx;
+	int yy;
+	if (!customTried) CustomBg_Load();
+	if (!customBg.scan0) return false;
+
+	if (customFit.width != ctx->width || customFit.height != ctx->height || !customFit.scan0) {
+		CustomBg_Fit(ctx->width, ctx->height);
+	}
+	if (!customFit.scan0) return false;
+	if (!Drawer2D_Clamp(ctx, &x, &y, &width, &height)) return true;
+
+	for (yy = 0; yy < height; yy++) {
+		Mem_Copy(Bitmap_GetRow(dst, y + yy) + x, Bitmap_GetRow(&customFit, y + yy) + x, width * sizeof(BitmapCol));
+	}
+	return true;
+}
+
 void Launcher_DrawBackground(struct Context2D* ctx, int x, int y, int width, int height) {
+	if (CustomBg_Draw(ctx, x, y, width, height)) return;
 	if (Launcher_Theme.ClassicBackground && dirtBmp.scan0) {
 		ClearTile(x, y, width, height, ctx, &stoneBmp);
 	} else {
@@ -540,6 +646,7 @@ void Launcher_DrawBackground(struct Context2D* ctx, int x, int y, int width, int
 }
 
 void Launcher_DrawBackgroundAll(struct Context2D* ctx) {
+	if (CustomBg_Draw(ctx, 0, 0, ctx->width, ctx->height)) return;
 	if (Launcher_Theme.ClassicBackground && dirtBmp.scan0) {
 		ClearTile(0,        0, ctx->width,               TILESIZE, ctx, &dirtBmp);
 		ClearTile(0, TILESIZE, ctx->width, ctx->height - TILESIZE, ctx, &stoneBmp);
