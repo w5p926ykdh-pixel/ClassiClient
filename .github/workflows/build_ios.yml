@@ -1,7 +1,7 @@
 name: Build latest (iOS)
 # trigger via either push to selected branches or on manual run
 on:
-  push
+  push:
     branches:
       - main
       - master
